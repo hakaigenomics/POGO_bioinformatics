@@ -1,0 +1,5 @@
+dim(otus):	10630	81
+# ASVs Removed:	7100
+dim(otus_filt):	3530	81
+dim(seqtab.nosingletons.nochim):	81	3054
+proprtion of non-chimeras:	0.9827722
