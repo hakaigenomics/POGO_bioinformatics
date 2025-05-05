@@ -1,0 +1,227 @@
+---
+title: "POGO-metabarcoding-data-analysis"
+author: "Evan Morien and Libby Natola"
+date: "2025-04-30"
+output: html_document
+---
+
+## Set up environment 
+
+The first step for setting up our environment is loading the libraries that are used in data analysis. In some cases, the order that the libraries are loaded matters, so it is best not to modify it. Note that you need to have already installed libraries. Change the pathway we used in `setwd()` to your own working directory. Load in the project_data.RDS file. 
+
+We also set the plot themes which dictates general guidelines for plotting clean figures in ggplot.
+
+```{r setup, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE) # options for Rmarkdown only. Tells R to show the code in the final rendered output (eg. in HTML, PDF, or Word)
+
+#you must install these first if you want to load the data in using phyloseq and process with deseq
+library(tidyverse)
+library(reshape2)
+library(stringr)
+library(ape)
+library(phyloseq)
+library(data.table)
+library(viridis)
+library(qualpalr)
+library(ggplot2)
+library(vegan)
+library(ranacapa)
+library(plotly)
+
+setwd("/mnt/Genomics/Working/libby.natola/home/libby.natola/projects/POGO/")
+
+project_data <- readRDS("project_data.RDS")
+
+# plot settings/color palettes
+theme_set(theme_bw())
+
+#identify the number of colors you need from the factor you want to plot by
+numcol <- length(unique(sample_data(project_data)$Region)) #EXAMPLE ONLY, adjust per object being plotted
+
+# use a number seed to determine how qualpar samples your colors from its palette
+set.seed(13)
+
+# use qualpalr colour palettes for easily distinguishing taxa
+region_pal <- qualpal(n = numcol, colorspace = "pretty")
+```
+
+## Data Analysis
+
+The following code details the basic procedures for completing alpha and beta diversity analyses with a phyloseq object. Note that for both alpha and beta diversity analyses, data should be rarefied. Although there is an argument to be made against rarefying for beta diversity analyses, we find that with many of our lab experiments, the bias from differentially successful sequencing (i.e. samples with many more reads than others, or many fewer) will prevent the ordination from revealing meaningful biological signals in the data.
+
+### IMPORTANT: first, make sure you have data in phyloseq format
+
+If you don't have a phyloseq object ready, please see the script that details loading data from various sources into phyloseq (POGO-make-phyloseq). In the examples below, your complete, filtered phyloseq object is called `project_data`, and we loaded it into the environment in the previous step.
+
+### Rarefaction
+
+In eDNA sampling and sequencing, samples can vary widely in the number of sequences. This means some samples are more likely to detect rarer ASVs and have higher measured diversity, not because the sample was more diverse but only because the sample had greater sequencing depth. To account for this, we use rarefaction, the process of subsampling all samples to the same number of reads. By rarefying to a common depth, we standardize the sampling effort, ensuring that differences in diversity are due to real biological differences, not sequencing artifacts.
+
+#### Plot rarefaction curves 
+
+First we'll take a look at the number of reads we have per sample in our filtered dataset to get a sense of how our data look.  
+
+```{r plot_reads, message=FALSE}
+plot(sort(sample_sums(project_data))) #looking at sample read counts
+summary(sample_sums(project_data))
+```
+
+
+#### Make a rarefaction plot
+
+Next, we make a rarefaction plot. Rarefaction curves are similar to species accumulation curves in that they both show how the number of observed species (or ASVs) increases with sequencing depth (number of reads). As you sample more reads, you generally observe more species because you are sampling the rarer ASVs. The curve levels off when most species have already been observed — this plateau suggests that additional sequencing won't reveal many new taxa, and we use the plateau to determine what point to rarefy the data to. 
+
+```{r rarefaction_plot, message=FALSE, warning=FALSE, results='hide'}
+# first remove any samples with no data
+project_data <- prune_samples(sample_sums(project_data) >= 1, project_data)
+
+#making a rarefaction plot with ggrare() function. 
+pdf(NULL)  # Start a null PDF device so ggrare doesn't print the plot in rmd, not necessary in an R script
+p <- ggrare(project_data, step = 100, se = FALSE)
+dev.off()
+# OPTIONAL: facet_wrap the plot to see differences according to different sample sites, types, etc.
+#p + facet_wrap(~Region)
+
+#you can use the plot above to judge a rough cutoff for rarefaction. it is also possible to do this with QIIME's alpha rarefaction script if you have a .biom file
+
+#you can use the "which" command like the example below to see which samples you'll lose for a given cutoff value
+which(sample_sums(project_data) < 15000)
+```
+
+We can make a nice interactive plot with the package plotly using the following line of code: `ggplotly(p)`. This will allow you to click on aspects of the plot and get more information.
+
+`r ggplotly(p)`
+
+### Rarefy the data
+
+Now we can see that the curves seem to level off at 15,000, let's rarefy all the samples to that level. If you have some samples with fewer reads you will lose them.
+
+```{r rarefy_data}
+set.seed(24) #you must set a numerical seed like this for reproducibility, but keep in mind that if your diversity results differ significantly after changing the seed, then there may be issues with your data.
+project_data.rarefied <- rarefy_even_depth(project_data, sample.size = 15000)
+```
+
+Now you're ready to calculate diversity metrics on your data!
+
+### Alpha and Beta Diversity
+
+Alpha Diversity refers to the diversity of taxa within a single sample or site and is a measure of taxonomic richness and/or evenness. Beta diversity describes diversity of taxa between samples or sites, and it measures differences in species composition across environments.
+
+#### Calculate Alpha Diversity
+
+There are many different statistics that are used to report alpha diversity. At Hakai, we tend to report Chao1, which is an estimate of true species richness (i.e. number of species) in a sample, including those that may not have been observed due to limited sequencing depth. It uses the number of rare ASVs (those seen only once or twice) to correct for unsampled taxa. If your sample has many singletons (taxa seen only once), Chao1 assumes there are likely many more unseen species, so it increases the richness estimate. 
+
+Here we calculate chao1 with the r package `phyloseq`, then we plot it by Region.
+
+```{r calculate_chao1}
+project_data.chao1 <- estimate_richness(project_data.rarefied, split = TRUE, measures = c("Chao1")) #estimate richness
+sample_data(project_data.rarefied)$chao1 <- project_data.chao1$Chao1 #add to metadata (the rows are in the same order already)
+sample_data(project_data.rarefied)$chao1 <- as.numeric(sample_data(project_data.rarefied)$chao1)
+
+# use calculated alpha diversity to make basic plot with ggplot ####
+#this plot lets you customize things a bit more than the plot_richness function, if desired
+chao1_plot <- ggplot(sample_data(project_data.rarefied), aes(x=Region, y=chao1, color = Region))
+chao1_plot <- chao1_plot + geom_boxplot() + 
+  labs(title="Alpha Diversity by Region", x="Region", y="Chao1") + 
+  scale_colour_manual(values=region_pal$hex) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+Plot in plotly:
+
+`r ggplotly(chao1_plot)`
+
+#### Calculate Beta diversity
+
+To examine differences in taxonomic composition between samples, we typically calculate beta diversity using distance or dissimilarity metrics, which create a matrix with a value reflecting how different samples are for each pairwise sample comparison. A commonly used metric is the Bray–Curtis distance, which accounts for both the presence and relative abundance of taxa. In other situations we may use Jaccard distance, which only evaluates presence/absence of taxa, not abundance. 
+
+These distances are often visualized using ordination techniques like Principal Coordinates Analysis (PCoA) or Non-metric Multidimensional Scaling (NMDS), which plot samples in a reduced-dimensional space. In these plots, samples that cluster together have more similar taxonomic composition, while those farther apart are more different. 
+
+For this example we show NMDS made from Bray-Curtis distances. Be sure to use rarefied data for this. 
+
+```{r bray_nmds}
+set.seed(24)
+NMDS.bray <- ordinate(
+  physeq = project_data.rarefied, 
+  method = "NMDS", 
+  distance = "bray"
+) # you can choose different methods and distance metrics, see the ordinate help page for details. this function works with "phyloseq" class objects.
+
+# plot the beta div NMDS
+#we get more plotting control if we don't use the phyloseq plotting functions for ordination plots, and instead add the results of the ordination to our existing metadata
+NMDS <- as.data.frame(sample_data(project_data))
+bray <- as.data.frame(NMDS.bray$points)
+all(row.names(bray) == row.names(NMDS)) #sanity check #tests as true
+NMDS$NMDS.bray1 <- bray$MDS1
+NMDS$NMDS.bray2 <- bray$MDS2
+#OPTIONAL: sort data for better looking easier to read plots
+NMDS.sort <- NMDS[order(NMDS$Region),] #if you do create a sorted plotting object, remember to modify the plots below so that you are using it as the input, not the unsorted table
+
+#plain NMDS plot colored by "Region" and shaped by "Date"
+bray_nmds_plot <- ggplot(NMDS, aes(x=NMDS.bray1, y=NMDS.bray2, color = Region)) # change the first argument to NMDS.sort if the optional command was ran
+bray_nmds_plot <- bray_nmds_plot + geom_point(size=4) +
+  labs(title="NMDS by Region") + 
+  scale_fill_manual(values=region_pal$hex) + scale_colour_manual(values=region_pal$hex) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+
+#NOTE: beta div ordination plots like the one above are endlessly customizable, if you want to do something like draw lines between points to show how a time series connects, or make the points different sizes based on a factor, or any other advanced plotting technique, there will be examples online describing how to do this with ggplot
+```
+
+View the NMDS plot in plotly as well `ggplotly(bray_nmds_plot)`:
+
+`r ggplotly(bray_nmds_plot)`
+
+## Summarise taxa
+
+In addition to the diversity, you will probably also want to examine what taxa predominate your data. Here we will plot the most prevalent ASVs
+
+IMPORTANT NOTE: taxa summary plots should be made with non-rarefied data.
+
+### Create Plotting Objects
+
+First we need to reshape the data based on the taxonomic level you are interested in, and select the top N taxa to show in the plot. In our example, there are too many unique species to plot simply, so we'll look at just the top 20 families. We agglomerate the data to family rank by grouping together and summing all the ASVs from each family present in our data. 
+
+Next, we list the top 20 most abundant families, and calculate the relative abundance of each family in each sample. Then we plot the samples. 
+
+```{r taxa_}
+taxonomy_plot_obj <- project_data %>%
+  tax_glom(taxrank = "family") # agglomerate at your rank of interest 
+
+#OPTIONAL, OFTEN RECOMMENDED: select top taxa
+# recommend roughly 20 taxa maximum, since it becomes more difficult to distinguish colours with more taxa than that
+topOTUs <- names(sort(taxa_sums(taxonomy_plot_obj), TRUE)[1:20]) #where N is the number of taxa you want to retain for plotting purposes
+# filter taxa present to just those in the topOTUs list
+taxonomy_plot_obj <- prune_taxa(topOTUs, taxonomy_plot_obj) #note that this method of selecting the top OTUs will not show you the proportion of "non-top" OTUs in the plot. for a method that does this, see the last section of this guide.
+
+# REQUIRED: transform to relative abundance, melt to long format for plotting
+taxonomy_plot_obj <- taxonomy_plot_obj %>%
+  transform_sample_counts(function(x) {x/sum(x)} ) %>%  # Transform to rel. abundance
+  psmelt() %>%                                          # Melt to long format
+  arrange(family)                                        # Arrange by the rank you are going to use in the plot
+
+#### Create new Color Palette(s) ####
+set.seed(15)
+taxpal <- qualpal(n = 21, colorspace = "pretty")
+
+#### Make Plots ####
+#example plot showing relative abundance of taxa, with panels dividing samples according to region
+top_families <- ggplot(taxonomy_plot_obj, aes(x = Sample, y = Abundance, fill = family)) + 
+  facet_wrap(~Region, strip.position = "top", drop=TRUE, scales="free") + #OPTIONAL LINE: facet_wrap is the function for determining how plots are grouped within a multi-plot space
+  geom_bar(stat = "identity", width = 0.9) +
+  theme_bw() +
+  theme(strip.background = element_rect(fill="white")) + #these "theme" settings determine how the facet grid looks on the plot
+  theme(strip.text = element_text(colour = 'black')) +
+  geom_bar(stat = "identity", width = 1.0) + #geom_bar controls the bar plots themselves
+  scale_y_continuous(expand = c(0.005,0.005)) + #this controls the y axis scale, for bigger margins above and below, increase the numbers provided
+  scale_fill_manual(values = taxpal$hex) + #here's where to use the colour palette derived above
+  labs(title ="Top 20 families", x = "Sample", y = "Relative Abundance", fill = "Family" ) + #x and y axis labels
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.spacing = unit(0, "lines"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) #another "theme" command. a lot of extra control can be established here. this line ensures that there is no padding in the multi-plot grid
+```
+
+Plot this final figure with ggplotly.
+
+`r ggplotly(top_families)`
+
